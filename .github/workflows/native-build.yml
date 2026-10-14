@@ -78,17 +78,24 @@ jobs:
               windows-x64) printf '%s' '{"platform":"windows-x64","runner":"windows-latest"}' ;;
               macos-arm64) printf '%s' '{"platform":"macos-arm64","runner":"macos-latest"}' ;;
               *)
-                echo "::error::unknown platform: $1"
+                echo "::error::unknown platform: $1" >&2
                 exit 1
                 ;;
             esac
           }
 
-          if [ "$PLATFORM" = "all" ]; then
-            include="$(entry linux-x64),$(entry windows-x64),$(entry macos-arm64)"
-          else
-            include="$(entry "$PLATFORM")"
-          fi
+          case "$PLATFORM" in
+            all)
+              include="$(entry linux-x64),$(entry windows-x64),$(entry macos-arm64)"
+              ;;
+            linux-x64 | windows-x64 | macos-arm64)
+              include="$(entry "$PLATFORM")"
+              ;;
+            *)
+              echo "::error::unknown platform: $PLATFORM" >&2
+              exit 1
+              ;;
+          esac
 
           printf 'matrix={"include":[%s]}\n' "$include" >> "$GITHUB_OUTPUT"
 
@@ -176,6 +183,11 @@ jobs:
           key: conan-${{ matrix.platform }}-${{ env.CONAN_VERSION }}-${{ hashFiles('conan/base-recipe/**', 'conan/cmake/**', 'conan/profile-override', 'third-party/**') }}
           restore-keys: |
             conan-${{ matrix.platform }}-${{ env.CONAN_VERSION }}-
+
+      # `conan profile detect -e` keeps an existing profile, so a cache restored
+      # from an image with another compiler would keep pinning that one.
+      - name: Refresh the detected conan profile
+        run: rm -f conan/cache/profiles/default
 
       # Run through bash on every OS: bootstrap.sh is the documented Linux/macOS
       # entry point and it also accepts the Windows host (profile detect + PATH
