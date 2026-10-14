@@ -1,0 +1,368 @@
+# Manual build of the YSM native module (the ysm shared library built by
+# modules/lib-jni and consumed by the Java side of the mod).
+#
+# The build goes through this repository's own bootstrap entry points
+# (bootstrap.sh on GNU/Linux and macOS, bootstrap.cmd on Windows, see
+# docs/build_cn.md) and never calls `conan install` or `cmake` directly:
+# CMakeLists.txt aborts configuration unless YSM_DEPENDENCY_PROVIDER=conan,
+# which only the bootstrap flow provides, and bootstrap.cmd is the only place
+# that pins compiler.runtime=static for the host profile.
+#
+# This reproduces the contributor flow of docs/build_cn.md ("前置要求" .. "构建项目"):
+# `bootstrap setup` followed by `bootstrap build native`, with conan, cmake and
+# ninja installed on the runner. The official toolchain described under
+# "官方构建环境" (LLVM/clang-cl + prebuilt sysroots) is not installed here; pass
+# toolchain_path + target_profile to use a toolchain bundle that is already
+# present on the runner, which maps to `bootstrap build <profile> --toolchain <path>`.
+#
+# Trigger it by hand from the Actions tab ("Run workflow").
+name: Native build
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: What to build
+        type: choice
+        default: windows-x64
+        options:
+          - windows-x64
+          - linux-x64
+          - macos-arm64
+          - all
+      build_type:
+        description: Build type passed to conan and cmake
+        type: choice
+        default: Release
+        options:
+          - Release
+          - Debug
+      deps_only:
+        description: Only export recipes and install dependencies (--deps-only), do not build the library
+        type: boolean
+        default: false
+      toolchain_path:
+        description: Optional toolchain bundle path; leave empty to build the native profile
+        type: string
+        default: ""
+      target_profile:
+        description: Profile used with toolchain_path (linux-x64, windows-x64, macos-arm64, android-arm64)
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  # Documented in docs/build_cn.md "官方构建环境"; conanfile.py requires >= 2.28.
+  CONAN_VERSION: "2.29.1"
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Resolve the runner matrix
+        id: matrix
+        shell: bash
+        env:
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          set -euo pipefail
+
+          entry() {
+            case "$1" in
+              linux-x64) printf '%s' '{"platform":"linux-x64","runner":"ubuntu-latest"}' ;;
+              windows-x64) printf '%s' '{"platform":"windows-x64","runner":"windows-latest"}' ;;
+              macos-arm64) printf '%s' '{"platform":"macos-arm64","runner":"macos-latest"}' ;;
+              *)
+                echo "::error::unknown platform: $1"
+                exit 1
+                ;;
+            esac
+          }
+
+          if [ "$PLATFORM" = "all" ]; then
+            include="$(entry linux-x64),$(entry windows-x64),$(entry macos-arm64)"
+          else
+            include="$(entry "$PLATFORM")"
+          fi
+
+          printf 'matrix={"include":[%s]}\n' "$include" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.platform }} (${{ inputs.build_type }})
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    # A cold run builds every dependency from source, so the budget is large;
+    # it stays under the 360 minute hard limit so a hang fails with a log.
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      PLATFORM: ${{ matrix.platform }}
+      BUILD_TYPE: ${{ inputs.build_type }}
+      DEPS_ONLY: ${{ inputs.deps_only }}
+      TOOLCHAIN_PATH: ${{ inputs.toolchain_path }}
+      TARGET_PROFILE: ${{ inputs.target_profile }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install conan, cmake and ninja
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "conan==${CONAN_VERSION}" "cmake>=3.29" "ninja>=1.11"
+
+      - name: Install NASM
+        if: runner.os != 'macOS'
+        run: |
+          if command -v nasm >/dev/null 2>&1; then
+            nasm -v
+            exit 0
+          fi
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            choco install nasm -y --no-progress
+          else
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends nasm
+          fi
+          nasm -v
+
+      - name: Activate the MSVC developer environment
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path -LiteralPath $vswhere)) { throw "vswhere.exe not found: $vswhere" }
+          $install = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $install) { throw 'No Visual Studio installation with the C++ tools workload was found.' }
+          $devShell = Join-Path $install 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll'
+          if (-not (Test-Path -LiteralPath $devShell)) { throw "Developer shell module not found: $devShell" }
+
+          $before = @{}
+          Get-ChildItem env: | ForEach-Object { $before[$_.Name] = $_.Value }
+          Import-Module $devShell
+          Enter-VsDevShell -VsInstallPath $install -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
+          Get-ChildItem env: |
+            Where-Object { $before[$_.Name] -ne $_.Value } |
+            ForEach-Object { "$($_.Name)=$($_.Value)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8 }
+
+          # Fail here rather than deep inside the conan/cmake run if activation did not stick.
+          (Get-Command cl.exe -ErrorAction Stop).Source
+
+      - name: Show tool versions
+        run: |
+          conan --version
+          cmake --version | head -n 1
+          ninja --version
+          nasm -v || true
+
+      - name: Cache the Conan home
+        uses: actions/cache@v4
+        with:
+          path: conan/cache
+          key: conan-${{ matrix.platform }}-${{ env.CONAN_VERSION }}-${{ hashFiles('conan/base-recipe/**', 'conan/cmake/**', 'conan/profile-override', 'third-party/**') }}
+          restore-keys: |
+            conan-${{ matrix.platform }}-${{ env.CONAN_VERSION }}-
+
+      # Run through bash on every OS: bootstrap.sh is the documented Linux/macOS
+      # entry point and it also accepts the Windows host (profile detect + PATH
+      # tools), while staying independent of the executable bit in the index.
+      - name: Bootstrap setup
+        if: runner.os != 'Windows'
+        run: bash ./bootstrap.sh setup
+
+      # On Windows the documented entry point is bootstrap.cmd, which is the
+      # only one that pins compiler.runtime=static for the host profile.
+      - name: Bootstrap setup (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & .\bootstrap.cmd setup
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Bootstrap build
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+
+          profile="native"
+          extra=()
+
+          if [ -n "$TOOLCHAIN_PATH" ]; then
+            if [ -z "$TARGET_PROFILE" ]; then
+              echo "::error::target_profile must be set when toolchain_path is used"
+              exit 1
+            fi
+            profile="$TARGET_PROFILE"
+            extra+=(--toolchain "$TOOLCHAIN_PATH")
+          fi
+          if [ "$BUILD_TYPE" = "Debug" ]; then
+            extra+=(--debug)
+          fi
+          if [ "$DEPS_ONLY" = "true" ]; then
+            extra+=(--deps-only)
+          fi
+
+          bash ./bootstrap.sh build "$profile" "${extra[@]}"
+
+      - name: Bootstrap build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $profile = 'native'
+          $extra = @()
+
+          if ($env:TOOLCHAIN_PATH) {
+            if (-not $env:TARGET_PROFILE) { throw 'target_profile must be set when toolchain_path is used' }
+            $profile = $env:TARGET_PROFILE
+            $extra += @('--toolchain', $env:TOOLCHAIN_PATH)
+          }
+          if ($env:BUILD_TYPE -eq 'Debug') { $extra += '--debug' }
+          if ($env:DEPS_ONLY -eq 'true') { $extra += '--deps-only' }
+
+          & .\bootstrap.cmd @(@('build', $profile) + $extra)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # Keep the cached Conan home to the packages themselves; a failed clean is
+      # not worth failing a build that already produced the library.
+      - name: Trim the Conan build folders
+        run: |
+          conan cache clean --build < /dev/null ||
+            echo "::warning::conan cache clean --build failed, the cache keeps the build folders"
+        env:
+          CONAN_HOME: ${{ github.workspace }}/conan/cache
+
+      - name: Package the built library
+        if: runner.os != 'Windows' && env.DEPS_ONLY != 'true'
+        run: |
+          set -euo pipefail
+
+          build_dir="build/native-$(printf '%s' "$BUILD_TYPE" | tr '[:upper:]' '[:lower:]')"
+          lib_dir="$build_dir/modules/lib-jni"
+          lib="$(find "$lib_dir" -maxdepth 1 -type f \( -name 'libysm.so' -o -name 'libysm.dylib' \) -print -quit 2>/dev/null || true)"
+          if [ -z "$lib" ]; then
+            echo "::error::no ysm shared library found in $lib_dir"
+            find "$build_dir" -maxdepth 4 -type d 2>/dev/null | sort || true
+            exit 1
+          fi
+
+          stage="$(mktemp -d)"
+          cp "$lib" "$stage/"
+          if [ -f "$lib_dir/ysm.map" ]; then
+            cp "$lib_dir/ysm.map" "$stage/"
+          fi
+          {
+            echo "project: ysm native (modules/lib-jni)"
+            echo "platform: $PLATFORM"
+            echo "build_type: $BUILD_TYPE"
+            echo "library: $(basename "$lib")"
+            echo "commit: $GITHUB_SHA"
+            echo "ref: $GITHUB_REF_NAME"
+            echo "run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "conan: $(conan --version)"
+            echo "cmake: $(cmake --version | head -n 1)"
+            echo "generated: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          } > "$stage/MANIFEST.txt"
+
+          package_dir="build/pkg"
+          archive="ysm-native-$PLATFORM-$(printf '%s' "$BUILD_TYPE" | tr '[:upper:]' '[:lower:]').zip"
+          mkdir -p "$package_dir"
+          (cd "$stage" && zip -q -r "$archive" .)
+          mv "$stage/$archive" "$package_dir/"
+          rm -rf "$stage"
+
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$package_dir/$archive" > "$package_dir/$archive.sha256"
+          else
+            shasum -a 256 "$package_dir/$archive" > "$package_dir/$archive.sha256"
+          fi
+          cat "$package_dir/$archive.sha256"
+
+          {
+            echo "### Native build: $PLATFORM"
+            echo ""
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| build type | $BUILD_TYPE |"
+            echo "| library | $(basename "$lib") |"
+            echo "| archive | $archive |"
+            echo "| sha256 | $(cut -d' ' -f1 "$package_dir/$archive.sha256") |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Package the built library (Windows)
+        if: runner.os == 'Windows' && env.DEPS_ONLY != 'true'
+        shell: pwsh
+        run: |
+          $buildDir = "build/native-$($env:BUILD_TYPE.ToLower())"
+          $libDir = Join-Path $buildDir 'modules/lib-jni'
+          $lib = Get-ChildItem -LiteralPath $libDir -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -in @('ysm.dll', 'libysm.so', 'libysm.dylib') } |
+            Select-Object -First 1
+          if (-not $lib) {
+            Write-Host "::error::no ysm shared library found in $libDir"
+            Get-ChildItem -LiteralPath $buildDir -Recurse -Directory -ErrorAction SilentlyContinue |
+              Select-Object -First 50 | ForEach-Object { $_.FullName }
+            exit 1
+          }
+
+          $stage = Join-Path ([System.IO.Path]::GetTempPath()) ("ysm-pkg-" + [guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item -LiteralPath $lib.FullName -Destination $stage
+          $map = Join-Path $libDir 'ysm.map'
+          if (Test-Path -LiteralPath $map) { Copy-Item -LiteralPath $map -Destination $stage }
+
+          Set-Content -LiteralPath (Join-Path $stage 'MANIFEST.txt') -Encoding utf8 -Value @(
+            'project: ysm native (modules/lib-jni)',
+            "platform: $env:PLATFORM",
+            "build_type: $env:BUILD_TYPE",
+            "library: $($lib.Name)",
+            "commit: $env:GITHUB_SHA",
+            "ref: $env:GITHUB_REF_NAME",
+            "run: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID",
+            "conan: $(conan --version)",
+            "cmake: $(cmake --version | Select-Object -First 1)",
+            "generated: $((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))"
+          )
+
+          $packageDir = 'build/pkg'
+          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+          $archiveName = "ysm-native-$($env:PLATFORM)-$($env:BUILD_TYPE.ToLower()).zip"
+          $archive = Join-Path $packageDir $archiveName
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $archive -Force
+          Remove-Item -Recurse -Force $stage
+
+          $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLower()
+          Set-Content -LiteralPath "$archive.sha256" -Encoding utf8 -Value "$hash  $archiveName"
+          Get-ChildItem -LiteralPath $packageDir | Format-Table Name, Length
+
+          @(
+            "### Native build: $env:PLATFORM",
+            '',
+            '| item | value |',
+            '| --- | --- |',
+            "| build type | $env:BUILD_TYPE |",
+            "| library | $($lib.Name) |",
+            "| archive | $archiveName |",
+            "| sha256 | $hash |"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Upload the package
+        if: env.DEPS_ONLY != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ysm-native-${{ matrix.platform }}-${{ inputs.build_type }}
+          path: build/pkg/*
+          if-no-files-found: error
