@@ -244,7 +244,45 @@ jobs:
       # `conan profile detect -e` keeps an existing profile, so a cache restored
       # from an image with another compiler would keep pinning that one.
       - name: Refresh the detected conan profile
+        if: runner.os != 'Windows'
         run: rm -f conan/cache/profiles/default
+
+      - name: Prepare the Conan home (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Remove-Item -Force -ErrorAction SilentlyContinue 'conan/cache/profiles/default'
+          if ($env:TOOLCHAIN_PATH) {
+            Write-Host 'a toolchain bundle supplies the profiles, keeping the detected one'
+            exit 0
+          }
+
+          # Conan takes the Visual Studio version it activates from
+          # compiler.runtime_version alone for a clang profile
+          # (conan/tools/microsoft/visual.py:297-312): the detected v143 asks for
+          # Visual Studio 17, which this image does not have, and it would pass
+          # -vcvars_ver=14.3, a toolset VS 18 does not ship. Pin the value that
+          # matches the MSVC toolset that is actually installed (14.51 -> v145).
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'no Visual Studio installation with the C++ tools workload was found' }
+          $toolsetDir = Join-Path $vs 'VC\Tools\MSVC'
+          if (-not (Test-Path -LiteralPath $toolsetDir)) { throw "no MSVC toolset directory: $toolsetDir" }
+          $toolset = (Get-ChildItem -LiteralPath $toolsetDir -Directory |
+            Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1).Name
+          if (-not $toolset) { throw "no MSVC toolset under $toolsetDir" }
+          $runtimeVersion = 'v14' + ($toolset -split '\.')[1].Substring(0, 1)
+          Write-Host "MSVC toolset $toolset -> compiler.runtime_version=$runtimeVersion"
+
+          # CC/CXX are clang-cl, so this writes compiler=clang into the profile
+          # that bootstrap.cmd will then reuse with `conan profile detect -e`.
+          & conan profile detect
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $profile = (& conan profile path default | Select-Object -Last 1).Trim()
+          (Get-Content -LiteralPath $profile) -replace '^compiler\.runtime_version=.*$', "compiler.runtime_version=$runtimeVersion" |
+            Set-Content -LiteralPath $profile -Encoding utf8
+          Get-Content -LiteralPath $profile
 
       # Run through bash on every OS: bootstrap.sh is the documented Linux/macOS
       # entry point and it also accepts the Windows host (profile detect + PATH
