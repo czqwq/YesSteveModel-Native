@@ -3,6 +3,8 @@
 /build/*
 /local/*
 /.*/
+# Keep the CI workflows tracked even though /.*/ ignores dot entries.
+!/.github/
 /CMakeUserPresets.json
 /conan/cache
 __pycache__

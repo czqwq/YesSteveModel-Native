@@ -15,6 +15,11 @@
 # toolchain_path + target_profile to use a toolchain bundle that is already
 # present on the runner, which maps to `bootstrap build <profile> --toolchain <path>`.
 #
+# One deliberate difference from a plain contributor build: the Windows job
+# compiles with clang-cl from the runner image instead of the MSVC toolset that
+# `conan profile detect` would pick by default, because the native sources are
+# clang-only (see the "Select clang-cl (Windows)" step).
+#
 # Trigger it by hand from the Actions tab ("Run workflow").
 name: Native build
 
@@ -169,12 +174,64 @@ jobs:
           # Fail here rather than deep inside the conan/cmake run if activation did not stick.
           (Get-Command cl.exe -ErrorAction Stop).Source
 
+      # The Windows target is a clang-cl target (docs/build_cn.md "官方构建环境"),
+      # not an MSVC one: modules/gfx uses GNU inline asm (math/euler.h:202,
+      # renderer/cube/transform_avx2.h:198, renderer/parallel_executor.h:122) and
+      # per-function target attributes (core/src/cpu.h:18-19), neither of which
+      # MSVC accepts (an MSVC run stops at euler.h:202 with error C2059).
+      # The image ships clang-cl; CC/CXX make `conan profile detect` pick
+      # compiler=clang and CMake use the MSVC frontend variant.
+      - name: Select clang-cl (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsLlvm = $null
+          if (Test-Path -LiteralPath $vswhere) {
+            $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Llvm.Clang -property installationPath
+            if ($vs) { $vsLlvm = Join-Path $vs 'VC\Tools\Llvm' }
+          }
+
+          $candidates = @(
+            (Join-Path $env:ProgramFiles 'LLVM\bin'),
+            (Join-Path ${env:ProgramFiles(x86)} 'LLVM\bin')
+          )
+          if ($vsLlvm) {
+            $candidates += @((Join-Path $vsLlvm 'x64\bin'), (Join-Path $vsLlvm 'bin'))
+          }
+          $candidates = $candidates | Where-Object { $_ }
+
+          $llvmBin = $null
+          $onPath = Get-Command clang-cl.exe -ErrorAction SilentlyContinue
+          if ($onPath) { $llvmBin = Split-Path -Parent $onPath.Source }
+          if (-not $llvmBin) {
+            $llvmBin = $candidates |
+              Where-Object { Test-Path -LiteralPath (Join-Path $_ 'clang-cl.exe') } |
+              Select-Object -First 1
+          }
+          if (-not $llvmBin) { throw "clang-cl.exe not found on PATH or in: $($candidates -join ', ')" }
+
+          Write-Host "clang-cl: $(Join-Path $llvmBin 'clang-cl.exe')"
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $llvmBin -Encoding utf8
+          # compiler.runtime=static is already passed by bootstrap.cmd; the Release
+          # flags of conan/cmake/targets/windows-x64.cmake enable ThinLTO, whose
+          # bitcode objects need lld-link instead of link.exe.
+          Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value @(
+            'CC=clang-cl',
+            'CXX=clang-cl',
+            'LDFLAGS=-fuse-ld=lld'
+          )
+
       - name: Show tool versions
         run: |
           conan --version
           cmake --version | head -n 1
           ninja --version
           nasm -v || true
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            clang-cl --version
+            lld-link --version
+          fi
 
       - name: Cache the Conan home
         uses: actions/cache@v4
