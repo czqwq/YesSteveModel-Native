@@ -251,7 +251,11 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Remove-Item -Force -ErrorAction SilentlyContinue 'conan/cache/profiles/default'
+          # bootstrap.cmd exports CONAN_HOME only inside its own process, so set the
+          # same value here; otherwise the profile would land in the runner's
+          # ~/.conan2 and bootstrap would keep detecting its own v143 one.
+          $env:CONAN_HOME = Join-Path $env:GITHUB_WORKSPACE 'conan/cache'
+          Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $env:CONAN_HOME 'profiles/default')
           if ($env:TOOLCHAIN_PATH) {
             Write-Host 'a toolchain bundle supplies the profiles, keeping the detected one'
             exit 0
