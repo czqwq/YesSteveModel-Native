@@ -16,9 +16,11 @@
 # present on the runner, which maps to `bootstrap build <profile> --toolchain <path>`.
 #
 # One deliberate difference from a plain contributor build: the Windows job
-# compiles with clang-cl from the runner image instead of the MSVC toolset that
-# `conan profile detect` would pick by default, because the native sources are
-# clang-only (see the "Select clang-cl (Windows)" step).
+# compiles with clang-cl 22.1.5 (the LLVM version of the official toolchain)
+# instead of the MSVC toolset that `conan profile detect` would pick by default,
+# because the native sources are clang-only (see the "Select clang-cl (Windows)"
+# step); the older clang-cl that ships with the image lacks flags the project's
+# target file enables.
 #
 # Trigger it by hand from the Actions tab ("Run workflow").
 name: Native build
@@ -151,6 +153,44 @@ jobs:
             sudo apt-get install -y --no-install-recommends nasm
           fi
           nasm -v
+
+      # docs/build_cn.md pins the official toolchain to LLVM 22.1.5, and the Release
+      # flags of conan/cmake/targets/windows-x64.cmake need it: -funique-source-file-names
+      # only exists from clang 21 on (llvm-project release/21.x Driver/Options.td), so
+      # the image's LLVM 20 raises "unknown argument" and the /WX the recipes pass
+      # turns that into a hard error. Installed before the MSVC step so the PATH it
+      # exports already contains this bin directory.
+      - name: Install the official LLVM (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $llvmVersion = '22.1.5'
+          $llvmDir = "C:\llvm-$llvmVersion"
+          if (-not (Test-Path -LiteralPath (Join-Path $llvmDir 'bin\clang-cl.exe'))) {
+            # Staged on C: the workspace drive is the small one on these runners.
+            $staging = "C:\llvm-staging-$llvmVersion"
+            New-Item -ItemType Directory -Force -Path $staging | Out-Null
+            $archive = Join-Path $staging "clang+llvm-$llvmVersion-x86_64-pc-windows-msvc.tar.xz"
+            $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$llvmVersion/clang+llvm-$llvmVersion-x86_64-pc-windows-msvc.tar.xz"
+            Write-Host "downloading $url"
+            curl.exe -L --fail --retry 3 --retry-delay 5 -o $archive $url
+            if ($LASTEXITCODE -ne 0) { throw "downloading LLVM $llvmVersion failed with $LASTEXITCODE" }
+            # Windows' bsdtar shells out to an external `xz` for .tar.xz, which is not
+            # guaranteed to be on PATH, so decompress with Python's lzma and then let
+            # tar do the extraction.
+            $tarFile = [System.IO.Path]::ChangeExtension($archive, '.tar')
+            python -c "import lzma,shutil,sys; shutil.copyfileobj(lzma.open(sys.argv[1],'rb'), open(sys.argv[2],'wb'), 1 << 20)" $archive $tarFile
+            if ($LASTEXITCODE -ne 0) { throw "decompressing LLVM $llvmVersion failed with $LASTEXITCODE" }
+            New-Item -ItemType Directory -Force -Path $llvmDir | Out-Null
+            # the release archive has a single top level directory
+            tar -xf $tarFile -C $llvmDir --strip-components=1
+            if ($LASTEXITCODE -ne 0) { throw "extracting LLVM $llvmVersion failed with $LASTEXITCODE" }
+            Remove-Item -Recurse -Force $staging
+          }
+          $clangCl = Join-Path $llvmDir 'bin\clang-cl.exe'
+          if (-not (Test-Path -LiteralPath $clangCl)) { throw "clang-cl.exe missing after installing $llvmDir" }
+          & $clangCl --version
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value (Join-Path $llvmDir 'bin') -Encoding utf8
 
       - name: Activate the MSVC developer environment
         if: runner.os == 'Windows'
