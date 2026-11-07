@@ -36,6 +36,7 @@ target_link_libraries(ysm-core PUBLIC
         absl::log
         absl::time
 )
+target_link_libraries(ysm-core PRIVATE absl::function_ref)
 
 # tracy
 if (YSM_ENABLE_TRACY)
@@ -58,6 +59,4 @@ endif ()
 if (YSM_LINUX OR YSM_MACOS)
     find_package(Iconv REQUIRED)
     target_link_libraries(ysm-core PRIVATE Iconv::Iconv)
-elseif (YSM_WINDOWS)
-    target_link_libraries(ysm-core PRIVATE synchronization) # TODO: 适配 win7 后要处理
 endif ()

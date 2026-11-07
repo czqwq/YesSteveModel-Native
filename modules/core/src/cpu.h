@@ -17,9 +17,11 @@
 #if defined(__clang__) || defined(__GNUC__)
 #define YSM_TARGET_AVX512 __attribute__((target("avx512f,avx512vl,avx512bw")))
 #define YSM_TARGET_AVX2 __attribute__((target("avx2,fma")))
+#define YSM_TARGET_SSE41 __attribute__((target("sse4.1,sse3,ssse3,popcnt")))
 #else
 #define YSM_TARGET_AVX512
 #define YSM_TARGET_AVX2
+#define YSM_TARGET_SSE41
 #endif
 
 #elif defined(YSM_ARM64)
